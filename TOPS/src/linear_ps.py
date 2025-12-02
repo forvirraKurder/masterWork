@@ -7,7 +7,7 @@ class PowerSystemModelLinearization:
         self.ps = ps
 
         self.n = self.ps.n_states
-        self.eps = 1e-7
+        self.eps = 1e-12
         self.linearization_ready = False
         self.eigenvalues_ready = False
         self.output_functions = []  # List to store output functions

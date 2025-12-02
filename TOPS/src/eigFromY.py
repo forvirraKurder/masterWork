@@ -24,8 +24,8 @@ class EigFromY:
         self.bus_idx = {name: i for i, name in enumerate(self.bus_names)}
 
         # --- VSC (UIC) indexing: support multiple UIC devices ---
-        self.vsc_devices = []  # list of dicts: {'name': ..., 'bus': ...}
-        self.vsc_bus = None  # kept for backward compatibility (first device)
+        self.vsc_devices = []
+        self.vsc_bus = None
         self.vsc_name = None
 
         if 'vsc' in self.model and 'UIC_open' in self.model['vsc']:
@@ -36,12 +36,16 @@ class EigFromY:
                 name_col_uic = uic_header.index('name')
 
                 # collect *all* UIC devices
-                for row in uic_table[1:]:
+                for uic_idx, row in enumerate(uic_table[1:]):
                     name = row[name_col_uic]
                     bus = row[bus_col]
-                    self.vsc_devices.append({'name': name, 'bus': bus})
+                    self.vsc_devices.append({
+                        'name': name,
+                        'bus': bus,
+                        'uic_index': uic_idx,  # <--- critical
+                    })
 
-                # for backward-compatibility keep the first one
+                # backward-compatibility
                 if self.vsc_devices:
                     self.vsc_name = self.vsc_devices[0]['name']
                     self.vsc_bus = self.vsc_devices[0]['bus']
@@ -51,10 +55,26 @@ class EigFromY:
         self.Y_bus_lines_dq = self.build_Ybus_dq_lines()
 
         # Numerical transfer functions from inputs to outputs
+        # Numerical transfer functions from inputs to outputs
         s = sp.symbols('s')
-        self.inputs = [['UIC_open', 'v_t_d', 0], ['UIC_open', 'v_t_q', 0]]
-        self.outputs = [['UIC_open',  'i_x', 0], ['UIC_open',      'i_y', 0]]
-        self.numerical_tf = self.numeric_transfer_functions()
+
+        self.inputs = []
+        self.outputs = []
+
+        for dev in self.vsc_devices:
+            idx = dev['uic_index']
+            # same signals, different UIC index
+            self.inputs += [
+                ['UIC_open', 'v_t_d', idx],
+                ['UIC_open', 'v_t_q', idx],
+            ]
+            self.outputs += [
+                ['UIC_open', 'i_x', idx],
+                ['UIC_open', 'i_y', idx],
+            ]
+
+        # If there are no VSCs, you might want to set numerical_tf = None
+        self.numerical_tf = self.numeric_transfer_functions() if self.vsc_devices else None
         self.analytical_tf = self.analytical_transfer_function(s)
 
         # Build symbolic Y_nodal_dq matrices
@@ -230,29 +250,29 @@ class EigFromY:
     # -------------------------------------------------------------------------
     # Transfer functions
     # -------------------------------------------------------------------------
-
     def numeric_transfer_functions(self):
         """
-        Build transfer function matrix from inputs to outputs.
-        Inputs and outputs are defined in self.inputs / self.outputs.
-        Returns a control.TransferFunction MIMO object.
+        Single MIMO TF with all UICs:
+        size = (2 * n_uic outputs) x (2 * n_uic inputs)
         """
         ps_lin = dps_mdl.PowerSystemModelLinearization(self.ps)
-        inputs = self.inputs
-        outputs = self.outputs
-        ps_lin.linearize(inputs=inputs, outputs=outputs)
-        self.ps_lin = ps_lin  # keep for later inspection if needed
+        ps_lin.linearize(inputs=self.inputs, outputs=self.outputs)
+        self.ps_lin = ps_lin
 
         ss = control.ss(ps_lin.a, ps_lin.b, ps_lin.c, ps_lin.d)
-        tf = control.ss2tf(ss)
+        tf = control.ss2tf(ss)  # MIMO TransferFunction
 
+        # Optional sign changes as before, but now for *all* pairs:
+        # here: each 2x2 block has structure [[·, ·], [·, ·]]
+        n_uic = len(self.vsc_devices)
+        for k in range(n_uic):
+            row0 = 2 * k
+            col0 = 2 * k
+            # (row0, col0+1) and (row0+1, col0) are the cross terms
+            tf.num[row0][col0 + 1] *= -1
+            tf.num[row0 + 1][col0] *= -1
 
-
-        # Change sign of the TF from input 1 to output 0
-        tf.num[0][1] *= -1  # or: tf.num[0][1] = -tf.num[0][1]
-        tf.num[1][0] *= -1  # or: tf.num[1][0] = -tf.num[1][0]
-
-        return tf
+        return tf  # full MIMO object
 
     def tf_to_sympy(self, tf_ij, s):
         """
@@ -305,18 +325,30 @@ class EigFromY:
 
         # Helper: pick the correct 2x2 TF block for a given device
         def get_tf_block(dev):
-            # case 1: we got a dict of per-device TFs
+            # case 1: dict of per-device blocks (analytical_tf)
             if isinstance(tf, dict):
                 name = dev['name']
                 if name not in tf:
                     raise KeyError(
                         f"No transfer function block provided for UIC '{name}'. "
-                        "Either add it to the tf dict or pass a single 2x2 block "
-                        "to be reused for all UICs."
+                        "Either add it to the tf dict or pass a single TF "
+                        "or a full MIMO TF."
                     )
                 return tf[name]
 
-            # case 2: a single 2x2 block is shared among all UIC devices
+            # case 2: full MIMO numeric TF, with all UICs stacked
+            if isinstance(tf, control.TransferFunction):
+                k = dev['uic_index']  # which UIC in UIC_open
+                row0 = 2 * k
+                col0 = 2 * k
+
+                block = np.empty((2, 2), dtype=object)
+                for i in range(2):
+                    for j in range(2):
+                        block[i, j] = tf[row0 + i, col0 + j]  # SISO TF
+                return block
+
+            # case 3: single 2×2 block shared across all UICs
             return tf
 
         # Add a 2x2 dynamic admittance block at the bus of each UIC
@@ -471,43 +503,21 @@ class EigFromY:
                          [-tf_im, tf_re]], dtype=object)
 
     def analytical_transfer_function(self, s):
-        """
-        Return a dict mapping each VSC name -> 2x2 TF block:
-            {
-                'VSC1': [[Re1, Im1], [-Im1, Re1]],
-                'VSC2': [[Re2, Im2], [-Im2, Re2]],
-                ...
-            }
-
-        build_sympy_Y_nodal_dq already knows how to handle this dict
-        and will put each block at the correct bus.
-        """
-
-        # 1) Define parameters for each VSC (manual, quick way).
-        #    Make sure these keys match self.vsc_devices[i]['name'].
-        vsc_params = {
-            'UIC1': dict(Ki=0.01, xf=0.10),
-            'UIC2': dict(Ki=0.01, xf=0.10),
-        }
 
         tf_dict = {}
-        index = 0
 
         for dev in self.vsc_devices:
             name = dev['name']
+            idx = dev['uic_index']
 
-            # Get Ki, xf for this device; fall back to some default if missing
-            Ki = vsc_params.get(name, {}).get('Ki')
-            xf = vsc_params.get(name, {}).get('xf')
+            Ki = self.ps.vsc['UIC_open'].par['Ki'][idx]
+            xf = self.ps.vsc['UIC_open'].par['xf'][idx]
 
-            # Get P, Q for this device.
-            # Assumes your ps object has vsc[name] entries with _input_values['p_ref'], ['q_ref']
-            P = self.ps.vsc['UIC_open']._input_values['p_ref'][index]
-            Q = self.ps.vsc['UIC_open']._input_values['q_ref'][index]
+            P = self.ps.vsc['UIC_open']._input_values['p_ref'][idx]
+            Q = self.ps.vsc['UIC_open']._input_values['q_ref'][idx]
             print(f"Building analytical TF for VSC '{name}': Ki={Ki}, xf={xf}, P={P}, Q={Q}")
 
             tf_block = self.make_vsc_tf_block(s, Ki, xf, P, Q)
             tf_dict[name] = tf_block
-            index += 1
 
         return tf_dict
