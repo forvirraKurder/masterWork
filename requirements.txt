@@ -1,0 +1,9 @@
+pytest
+pandapower
+pandas~=2.2.3
+matplotlib~=3.9.2
+numpy~=2.1.1
+scipy~=1.14.1
+control~=0.10.2
+ipywidgets~=8.1.5
+ipython~=8.27.0
