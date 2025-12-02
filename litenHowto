@@ -1,0 +1,3 @@
+Bare kjør EigFromYTest. ikke så mye fleksibilitet her. for øyeblikket.
+
+men det er mulig å lage en mer generell test som tar inn forskjellige omformere og element.
